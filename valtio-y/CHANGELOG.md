@@ -1,5 +1,11 @@
 # valtio-y
 
+## 1.1.4
+
+### Patch Changes
+
+- ac1095d: Preserve nested array and map data when undoing replacements that reuse an existing child proxy inside a new parent array.
+
 ## 1.1.3
 
 ### Patch Changes

@@ -4,11 +4,14 @@ import type { ValtioYjsCoordinator } from "../core/coordinator";
 import { plainObjectToYType } from "../core/converter";
 import type { PostTransactionQueue } from "./post-transaction-queue";
 import type { Logger } from "../core/logger";
+import { isYSharedContainer } from "../core/guards";
+import { cleanupControllerTreeForYType } from "../reconcile/controller-cleanup";
 
 // Apply pending map deletes (keys) first for determinism
 export function applyMapDeletes(
   mapDeletes: Map<Y.Map<unknown>, Set<string>>,
   log: Logger,
+  coordinator: ValtioYjsCoordinator,
 ): void {
   for (const [yMap, keys] of mapDeletes) {
     log.debug("Applying Map Deletes:", {
@@ -18,7 +21,12 @@ export function applyMapDeletes(
       keys: Array.from(keys),
     });
     for (const key of keys) {
-      if (yMap.has(key)) yMap.delete(key);
+      if (!yMap.has(key)) continue;
+      const oldValue = yMap.get(key);
+      if (isYSharedContainer(oldValue)) {
+        cleanupControllerTreeForYType(coordinator, oldValue);
+      }
+      yMap.delete(key);
     }
   }
 }
@@ -46,6 +54,10 @@ export function applyMapSets(
         coordinator.state,
         coordinator.logger,
       );
+      const oldValue = yMap.get(key);
+      if (isYSharedContainer(oldValue) && oldValue !== yValue) {
+        cleanupControllerTreeForYType(coordinator, oldValue);
+      }
       coordinator.logger.trace("[mapApply] map.set", { key });
       yMap.set(key, yValue);
       if (entry.after) {

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import * as Y from "yjs";
-import { createYjsProxy } from "../index";
+import { createYjsProxy, VALTIO_Y_ORIGIN } from "../index";
 
 const waitMicrotask = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -84,6 +84,79 @@ describe("WriteScheduler: Subtree Purging Necessity", () => {
       expect(result).toEqual([{ nested: { value: "item1" } }]);
       expect(proxy).toHaveLength(1);
       expect(proxy[0]?.nested.value).toBe("item1");
+    });
+
+    it("should keep undo updates valid when stale child writes target a replaced map key", async () => {
+      type State = {
+        child?: {
+          id: string;
+          memberIds: string[];
+          meta: { title: string };
+        };
+      };
+      const originalChild = {
+        id: "child",
+        memberIds: ["a", "b"],
+        meta: { title: "initial" },
+      };
+      const replacementChild = {
+        id: "replacement",
+        memberIds: ["replacement"],
+        meta: { title: "replacement" },
+      };
+      const doc = new Y.Doc();
+      const { proxy, dispose } = createYjsProxy<State>(doc, {
+        getRoot: (d) => d.getMap("state"),
+      });
+      const root = doc.getMap("state");
+      const undoManager = new Y.UndoManager(root, {
+        trackedOrigins: new Set([VALTIO_Y_ORIGIN]),
+        captureTimeout: 0,
+      });
+
+      try {
+        proxy.child = originalChild;
+        await waitMicrotask();
+        undoManager.clear();
+
+        proxy.child!.memberIds = ["stale"];
+        proxy.child = replacementChild;
+        await waitMicrotask();
+
+        expect(root.toJSON()).toEqual({ child: replacementChild });
+
+        const replacementUpdate = Y.encodeStateAsUpdate(doc);
+        const undoUpdates: Uint8Array[] = [];
+        const captureUpdate = (update: Uint8Array) => undoUpdates.push(update);
+
+        doc.on("update", captureUpdate);
+        try {
+          undoManager.undo();
+          await waitMicrotask();
+        } finally {
+          doc.off("update", captureUpdate);
+        }
+
+        expect(root.toJSON()).toEqual({ child: originalChild });
+
+        const freshDoc = new Y.Doc();
+        try {
+          Y.applyUpdate(freshDoc, replacementUpdate);
+          for (const update of undoUpdates) {
+            Y.applyUpdate(freshDoc, update);
+          }
+
+          expect(freshDoc.getMap("state").toJSON()).toEqual({
+            child: originalChild,
+          });
+        } finally {
+          freshDoc.destroy();
+        }
+      } finally {
+        undoManager.destroy();
+        dispose();
+        doc.destroy();
+      }
     });
 
     it("should handle deep nested stale writes", async () => {

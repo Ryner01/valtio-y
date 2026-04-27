@@ -4,7 +4,8 @@ import type { ValtioYjsCoordinator } from "../core/coordinator";
 import { plainObjectToYType } from "../core/converter";
 import type { PostTransactionQueue } from "./post-transaction-queue";
 import { getYItemId, yTypeToJSON, hasProperty } from "../core/types";
-import type { Logger } from "../core/logger";
+import { isYSharedContainer } from "../core/guards";
+import { cleanupControllerTreeForYType } from "../reconcile/controller-cleanup";
 
 /**
  * Execute array operations with cleaner multi-stage approach based on explicit intents.
@@ -55,7 +56,7 @@ export function applyArrayOperations(
     });
 
     // 2) Handle Pure Deletes next (descending order to avoid index shifts)
-    handleDeletes(coordinator.logger, yArray, deletesForArray);
+    handleDeletes(coordinator, yArray, deletesForArray);
     coordinator.logger.trace("[arrayApply] after deletes", {
       len: yArray.length,
       json: toJSONSafe(yArray),
@@ -118,6 +119,10 @@ function handleReplaces(
     // Canonical replace: delete then insert, with defensive clamping for safety under rapid mixed ops
     const inBounds = index >= 0 && index < yArray.length;
     if (inBounds) {
+      const oldValue = yArray.get(index) as unknown;
+      if (isYSharedContainer(oldValue)) {
+        cleanupControllerTreeForYType(coordinator, oldValue);
+      }
       yArray.delete(index, 1);
       const insertIndex = Math.min(Math.max(index, 0), yArray.length);
       yArray.insert(insertIndex, [yValue]);
@@ -140,12 +145,13 @@ function handleReplaces(
  * Handle pure delete operations
  */
 function handleDeletes(
-  logger: Logger,
+  coordinator: ValtioYjsCoordinator,
   yArray: Y.Array<unknown>,
   deletes: Map<number, number>,
 ): void {
   if (deletes.size === 0) return;
 
+  const logger = coordinator.logger;
   logger.debug("[arrayApply] handling deletes", { count: deletes.size });
 
   // Sort indices in descending order to avoid index shifting issues
@@ -154,6 +160,10 @@ function handleDeletes(
   for (const index of sortedDeletes) {
     logger.debug("[arrayApply] delete", { index, length: yArray.length });
     if (index >= 0 && index < yArray.length) {
+      const oldValue = yArray.get(index) as unknown;
+      if (isYSharedContainer(oldValue)) {
+        cleanupControllerTreeForYType(coordinator, oldValue);
+      }
       yArray.delete(index, 1);
     }
   }

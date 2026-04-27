@@ -4,6 +4,76 @@ import { createYjsProxy, VALTIO_Y_ORIGIN } from "../../src/index";
 
 const waitMicrotask = () => Promise.resolve();
 
+async function flushQueuedYjsWrites() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+type Section = {
+  id: string;
+  title: string;
+  layout: "grid";
+  position: { x: number; y: number };
+  memberIds: string[];
+  columns: number;
+};
+
+type TestState = {
+  root?: {
+    id: string;
+    sections: Section[];
+  };
+};
+
+function createSections(): Section[] {
+  return [
+    {
+      id: "full-section",
+      title: "Full section",
+      layout: "grid",
+      position: { x: 0, y: 0 },
+      memberIds: ["full-a", "full-b"],
+      columns: 2,
+    },
+    {
+      id: "partial-section",
+      title: "Partial section",
+      layout: "grid",
+      position: { x: 0, y: 300 },
+      memberIds: ["partial-a", "partial-b", "partial-c"],
+      columns: 2,
+    },
+  ];
+}
+
+function toPlainSection(section: Section): Section {
+  return {
+    id: section.id,
+    title: section.title,
+    layout: section.layout,
+    position: {
+      x: section.position.x,
+      y: section.position.y,
+    },
+    memberIds: [...section.memberIds],
+    columns: section.columns,
+  };
+}
+
+function readRoot(doc: Y.Doc): NonNullable<TestState["root"]> {
+  const root = doc.getMap("state").get("root") as
+    | { toJSON?: () => NonNullable<TestState["root"]> }
+    | undefined;
+  if (!root?.toJSON) throw new Error("Expected Yjs root map");
+  return root.toJSON();
+}
+
+function collectSectionsWithoutMemberIds(doc: Y.Doc): string[] {
+  return readRoot(doc)
+    .sections.filter((section) => !Array.isArray(section.memberIds))
+    .map((section) => section.id);
+}
+
 describe("UndoManager integration", () => {
   let doc: Y.Doc;
 
@@ -246,6 +316,136 @@ describe("UndoManager integration", () => {
       await waitMicrotask();
 
       expect(proxy).toEqual(["a", "b", "c"]);
+    });
+  });
+
+  describe("Proxy reuse during replacement", () => {
+    it("does not lose nested arrays after undo when a proxied child is reused in a replaced array", async () => {
+      const localDoc = new Y.Doc();
+      const { proxy: state, dispose } = createYjsProxy<TestState>(localDoc, {
+        getRoot: (yDoc) => yDoc.getMap("state"),
+      });
+      const undoManager = new Y.UndoManager(localDoc.getMap("state"), {
+        trackedOrigins: new Set([VALTIO_Y_ORIGIN]),
+        captureTimeout: 0,
+      });
+
+      try {
+        state.root = { id: "root", sections: createSections() };
+        await flushQueuedYjsWrites();
+        undoManager.clear();
+
+        const retainedSectionProxy = state.root!.sections[1]!;
+        retainedSectionProxy.memberIds = ["partial-c"];
+        state.root!.sections = [retainedSectionProxy];
+        await flushQueuedYjsWrites();
+
+        expect(readRoot(localDoc).sections).toEqual([
+          expect.objectContaining({
+            id: "partial-section",
+            memberIds: ["partial-c"],
+          }),
+        ]);
+
+        const deleteStateUpdate = Y.encodeStateAsUpdate(localDoc);
+        const undoUpdates: Uint8Array[] = [];
+        const captureUpdate = (update: Uint8Array) => undoUpdates.push(update);
+
+        localDoc.on("update", captureUpdate);
+        try {
+          undoManager.undo();
+          await flushQueuedYjsWrites();
+        } finally {
+          localDoc.off("update", captureUpdate);
+        }
+
+        expect(collectSectionsWithoutMemberIds(localDoc)).toEqual([]);
+
+        const freshDoc = new Y.Doc();
+        try {
+          Y.applyUpdate(freshDoc, deleteStateUpdate);
+          for (const update of undoUpdates) {
+            Y.applyUpdate(freshDoc, update);
+          }
+
+          expect(collectSectionsWithoutMemberIds(freshDoc)).toEqual([]);
+          expect(readRoot(freshDoc).sections[1]).toEqual(
+            expect.objectContaining({
+              id: "partial-section",
+              memberIds: ["partial-a", "partial-b", "partial-c"],
+            }),
+          );
+        } finally {
+          freshDoc.destroy();
+        }
+      } finally {
+        undoManager.destroy();
+        dispose();
+        localDoc.destroy();
+      }
+    });
+
+    it("keeps nested arrays after undo when the retained child is rebuilt as plain data", async () => {
+      const localDoc = new Y.Doc();
+      const { proxy: state, dispose } = createYjsProxy<TestState>(localDoc, {
+        getRoot: (yDoc) => yDoc.getMap("state"),
+      });
+      const undoManager = new Y.UndoManager(localDoc.getMap("state"), {
+        trackedOrigins: new Set([VALTIO_Y_ORIGIN]),
+        captureTimeout: 0,
+      });
+
+      try {
+        state.root = { id: "root", sections: createSections() };
+        await flushQueuedYjsWrites();
+        undoManager.clear();
+
+        const retainedSectionProxy = state.root!.sections[1]!;
+        retainedSectionProxy.memberIds = ["partial-c"];
+        state.root!.sections = [toPlainSection(retainedSectionProxy)];
+        await flushQueuedYjsWrites();
+
+        expect(readRoot(localDoc).sections).toEqual([
+          expect.objectContaining({
+            id: "partial-section",
+            memberIds: ["partial-c"],
+          }),
+        ]);
+
+        const deleteStateUpdate = Y.encodeStateAsUpdate(localDoc);
+        const undoUpdates: Uint8Array[] = [];
+        const captureUpdate = (update: Uint8Array) => undoUpdates.push(update);
+
+        localDoc.on("update", captureUpdate);
+        try {
+          undoManager.undo();
+          await flushQueuedYjsWrites();
+        } finally {
+          localDoc.off("update", captureUpdate);
+        }
+
+        const freshDoc = new Y.Doc();
+        try {
+          Y.applyUpdate(freshDoc, deleteStateUpdate);
+          for (const update of undoUpdates) {
+            Y.applyUpdate(freshDoc, update);
+          }
+
+          expect(collectSectionsWithoutMemberIds(freshDoc)).toEqual([]);
+          expect(readRoot(freshDoc).sections[1]).toEqual(
+            expect.objectContaining({
+              id: "partial-section",
+              memberIds: ["partial-a", "partial-b", "partial-c"],
+            }),
+          );
+        } finally {
+          freshDoc.destroy();
+        }
+      } finally {
+        undoManager.destroy();
+        dispose();
+        localDoc.destroy();
+      }
     });
   });
 

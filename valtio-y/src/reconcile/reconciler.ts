@@ -7,22 +7,7 @@ import type { ValtioYjsCoordinator } from "../core/coordinator";
 import { isYSharedContainer, isYArray, isYMap } from "../core/guards";
 import { yTypeToJSON } from "../core/types";
 import { ValtioYReconciliationError } from "../core/errors";
-
-function cleanupNestedValue(
-  coordinator: ValtioYjsCoordinator,
-  value: unknown,
-): void {
-  if (!value || typeof value !== "object") {
-    return;
-  }
-  const yType = coordinator.state.valtioProxyToYType.get(value as object);
-  if (!yType) {
-    return;
-  }
-  coordinator.unregisterSubscription(yType);
-  coordinator.state.yTypeToValtioProxy.delete(yType);
-  coordinator.state.valtioProxyToYType.delete(value as object);
-}
+import { cleanupNestedValue } from "./controller-cleanup";
 
 /**
  * Finds object-type items that were removed from an array, handling duplicates correctly.

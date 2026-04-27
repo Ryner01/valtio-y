@@ -51,6 +51,14 @@ function collectYSubtree(root: unknown): {
   return { maps, arrays };
 }
 
+interface PendingBatchSnapshot {
+  mapSets: Map<Y.Map<unknown>, Map<string, PendingMapEntry>>;
+  mapDeletes: Map<Y.Map<unknown>, Set<string>>;
+  arraySets: Map<Y.Array<unknown>, Map<number, PendingArrayEntry>>;
+  arrayDeletes: Map<Y.Array<unknown>, Map<number, number>>;
+  arrayReplaces: Map<Y.Array<unknown>, Map<number, PendingArrayEntry>>;
+}
+
 export class WriteScheduler {
   private readonly doc: Y.Doc;
   private readonly log: Logger;
@@ -302,6 +310,32 @@ export class WriteScheduler {
     }
   }
 
+  private purgePendingOpsForSubtree(
+    root: unknown,
+    batch: PendingBatchSnapshot,
+  ): { maps: number; arrays: number } {
+    const { maps, arrays } = collectYSubtree(root);
+    const purged = { maps: 0, arrays: 0 };
+
+    for (const yMap of maps) {
+      if (this.pendingMapSets.delete(yMap)) purged.maps++;
+      if (this.pendingMapDeletes.delete(yMap)) purged.maps++;
+      if (batch.mapSets.delete(yMap)) purged.maps++;
+      if (batch.mapDeletes.delete(yMap)) purged.maps++;
+    }
+
+    for (const arr of arrays) {
+      if (this.pendingArraySets.delete(arr)) purged.arrays++;
+      if (this.pendingArrayDeletes.delete(arr)) purged.arrays++;
+      if (this.pendingArrayReplaces.delete(arr)) purged.arrays++;
+      if (batch.arraySets.delete(arr)) purged.arrays++;
+      if (batch.arrayDeletes.delete(arr)) purged.arrays++;
+      if (batch.arrayReplaces.delete(arr)) purged.arrays++;
+    }
+
+    return purged;
+  }
+
   private scheduleFlush(): void {
     if (this.flushScheduled) return;
     this.flushScheduled = true;
@@ -354,33 +388,57 @@ export class WriteScheduler {
       }
     }
 
-    // Purge stale operations targeting children of items that will be replaced in this flush
-    // This ensures we don't try to mutate a subtree after its parent is deleted/replaced in the same transaction
+    // Purge stale operations targeting subtrees that will be replaced or deleted
+    // in this flush, before any stale descendant write can reach Yjs.
+    const batch: PendingBatchSnapshot = {
+      mapSets,
+      mapDeletes,
+      arraySets,
+      arrayDeletes,
+      arrayReplaces,
+    };
+
+    if (mapSets.size > 0 || mapDeletes.size > 0) {
+      const purged = { maps: 0, arrays: 0 };
+
+      for (const [yMap, keyToEntry] of Array.from(mapSets.entries())) {
+        if (!mapSets.has(yMap)) continue;
+        for (const key of Array.from(keyToEntry.keys())) {
+          if (!keyToEntry.has(key) || !yMap.has(key)) continue;
+          const result = this.purgePendingOpsForSubtree(yMap.get(key), batch);
+          purged.maps += result.maps;
+          purged.arrays += result.arrays;
+        }
+      }
+
+      for (const [yMap, keys] of Array.from(mapDeletes.entries())) {
+        if (!mapDeletes.has(yMap)) continue;
+        for (const key of Array.from(keys)) {
+          if (!keys.has(key) || !yMap.has(key)) continue;
+          const result = this.purgePendingOpsForSubtree(yMap.get(key), batch);
+          purged.maps += result.maps;
+          purged.arrays += result.arrays;
+        }
+      }
+
+      if (purged.maps > 0 || purged.arrays > 0) {
+        this.log.debug(
+          "[scheduler] Purged pending ops for replaced/deleted map-key subtrees",
+          purged,
+        );
+      }
+    }
+
     if (arrayReplaces.size > 0) {
       const purged = { maps: 0, arrays: 0 };
-      for (const [yArray, replaceMap] of arrayReplaces) {
+      for (const [yArray, replaceMap] of Array.from(arrayReplaces.entries())) {
+        if (!arrayReplaces.has(yArray)) continue;
         for (const index of replaceMap.keys()) {
           if (index >= 0 && index < yArray.length) {
             const oldItem = yArray.get(index) as unknown;
-            const { maps, arrays } = collectYSubtree(oldItem);
-
-            // Purge map operations targeting this subtree
-            for (const yMap of maps) {
-              if (this.pendingMapSets.delete(yMap)) purged.maps++;
-              if (this.pendingMapDeletes.delete(yMap)) purged.maps++;
-              // Also remove from the snapshotted maps that will be applied this flush
-              if (mapSets.delete(yMap)) purged.maps++;
-              if (mapDeletes.delete(yMap)) purged.maps++;
-            }
-            // Purge array operations targeting this subtree
-            for (const arr of arrays) {
-              if (this.pendingArraySets.delete(arr)) purged.arrays++;
-              if (this.pendingArrayDeletes.delete(arr)) purged.arrays++;
-              if (this.pendingArrayReplaces.delete(arr)) purged.arrays++;
-              if (arraySets.delete(arr)) purged.arrays++;
-              if (arrayDeletes.delete(arr)) purged.arrays++;
-              if (arrayReplaces.delete(arr)) purged.arrays++;
-            }
+            const result = this.purgePendingOpsForSubtree(oldItem, batch);
+            purged.maps += result.maps;
+            purged.arrays += result.arrays;
           }
         }
       }
@@ -417,25 +475,14 @@ export class WriteScheduler {
     // Purge stale operations targeting children of items that will be deleted in this flush
     if (arrayDeletes.size > 0) {
       const purged = { maps: 0, arrays: 0 };
-      for (const [yArray, deleteMap] of arrayDeletes) {
+      for (const [yArray, deleteMap] of Array.from(arrayDeletes.entries())) {
+        if (!arrayDeletes.has(yArray)) continue;
         for (const index of deleteMap.keys()) {
           if (index >= 0 && index < yArray.length) {
             const oldItem = yArray.get(index) as unknown;
-            const { maps, arrays } = collectYSubtree(oldItem);
-            for (const yMap of maps) {
-              if (this.pendingMapSets.delete(yMap)) purged.maps++;
-              if (this.pendingMapDeletes.delete(yMap)) purged.maps++;
-              if (mapSets.delete(yMap)) purged.maps++;
-              if (mapDeletes.delete(yMap)) purged.maps++;
-            }
-            for (const arr of arrays) {
-              if (this.pendingArraySets.delete(arr)) purged.arrays++;
-              if (this.pendingArrayDeletes.delete(arr)) purged.arrays++;
-              if (this.pendingArrayReplaces.delete(arr)) purged.arrays++;
-              if (arraySets.delete(arr)) purged.arrays++;
-              if (arrayDeletes.delete(arr)) purged.arrays++;
-              if (arrayReplaces.delete(arr)) purged.arrays++;
-            }
+            const result = this.purgePendingOpsForSubtree(oldItem, batch);
+            purged.maps += result.maps;
+            purged.arrays += result.arrays;
           }
         }
       }

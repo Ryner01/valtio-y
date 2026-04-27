@@ -306,6 +306,53 @@ describe("Memory Leak Prevention", () => {
       await waitMicrotask();
       expect(parentProxy.newKey).toBeUndefined(); // Not updated
     });
+
+    it("nested structure deletion: retained child proxies no longer write to Yjs", async () => {
+      const doc = new Y.Doc();
+      const yRoot = doc.getMap<unknown>("root");
+
+      const { proxy } = createYjsProxy<DeepNestedState>(doc, {
+        getRoot: (d) => d.getMap("root"),
+      });
+
+      proxy.parent = {
+        child: {
+          grandchild: {
+            value: 1,
+          },
+        },
+      };
+      await waitMicrotask();
+
+      const childProxy = proxy.parent!.child!;
+      const grandchildProxy = childProxy.grandchild!;
+
+      const yParent = yRoot.get("parent") as Y.Map<unknown>;
+      const yChild = yParent.get("child") as Y.Map<unknown>;
+      const yGrandchild = yChild.get("grandchild") as Y.Map<unknown>;
+
+      const updates: Uint8Array[] = [];
+      const captureUpdate = (update: Uint8Array) => updates.push(update);
+      doc.on("update", captureUpdate);
+
+      try {
+        delete proxy.parent;
+        await waitMicrotask();
+
+        const updatesAfterDelete = updates.length;
+
+        childProxy.newKey = "local-only";
+        grandchildProxy.value = 2;
+        await waitMicrotask();
+        await waitMicrotask();
+
+        expect(updates).toHaveLength(updatesAfterDelete);
+        expect(yChild.get("newKey")).toBeUndefined();
+        expect(yGrandchild.get("value")).not.toBe(2);
+      } finally {
+        doc.off("update", captureUpdate);
+      }
+    });
   });
 
   describe("Cache Cleanup", () => {
